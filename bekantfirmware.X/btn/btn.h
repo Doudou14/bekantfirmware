@@ -1,4 +1,3 @@
-
 #ifndef BTN_H
 #define BTN_H
 
@@ -9,6 +8,7 @@ typedef enum {
     INPUT_MEM_UP,
     INPUT_MEM_DOWN,
     INPUT_SAVE,
+    INPUT_RECAL, // both buttons pressed and released 5 times: start the end stop calibration
 } INPUT_t;
 
 void btn_init(void);
