@@ -47,6 +47,7 @@ typedef enum {
 #define CAL_STALL_CYCLES      4    // unchanged encoder for this long = stall
 #define CAL_STALL_TOLERANCE   2    // encoder counts
 #define CAL_TIMEOUT_CYCLES    600  // abort a phase after 60 s
+#define CAL_ERR_CYCLES        10   // abort after 1 s of negative encoder values
 #define CAL_MIN_RANGE         0x0200 // below this, the result is not credible
 
 BUI_state_t bui_state = BUI_STOP;
@@ -58,6 +59,7 @@ int16_t cur_pos; // accessed by bui_input() and bui_set_pos()
 
 static uint16_t cal_cycles;
 static uint8_t cal_stall;
+static uint8_t cal_err;
 static int16_t cal_last_pos;
 static int16_t cal_low_stop;
 static volatile bool cal_save_pending = false;
@@ -140,6 +142,7 @@ static void bui_cal_start_phase(BUI_state_t state, BCTRL_state_t target) {
     bui_state = state;
     cal_cycles = 0;
     cal_stall = 0;
+    cal_err = 0;
     cal_last_pos = cur_pos;
     bctrl_set_target(target);
 }
@@ -175,14 +178,27 @@ static bool bui_cal_stalled(int16_t pos) {
  * Nothing is stored unless both phases succeed.
  */
 static void bui_cal_step(int16_t pos) {
-    if (pos < 0 || cal_cycles >= CAL_TIMEOUT_CYCLES) {
-        // Encoder error or desk not reaching an end stop: give up.
+    if (cal_cycles >= CAL_TIMEOUT_CYCLES) {
+        // Desk not reaching an end stop: give up.
         // Previous limits are kept. If the desk was never calibrated,
         // it will be retried at next boot.
         bui_stop();
         return;
     }
     cal_cycles++;
+
+    if (pos < 0) {
+        // The very first transaction after the bus scan reports a negative
+        // value (the BCTRL_AFTER_SCAN command carries 0xfff6), and the
+        // encoders can report errors. Ignore these values for a while,
+        // but never use them; give up if the error persists.
+        cal_err++;
+        if (cal_err >= CAL_ERR_CYCLES) {
+            bui_stop();
+        }
+        return;
+    }
+    cal_err = 0;
 
     if (!bui_cal_stalled(pos)) {
         return;
