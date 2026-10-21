@@ -1,5 +1,3 @@
-
-
 #include "btn.h"
 #include <pic.h>
 #include <stdbool.h>       /* For true/false definition */
@@ -58,7 +56,9 @@ bool btn_debounce(ButtonState_t now_btn) {
 bool btn_debounce(ButtonState_t now_btn);
 
 typedef struct {
-    uint8_t save_hold;
+    uint8_t save_hold;  // samples during which both buttons are pressed
+    uint8_t tap_count;  // consecutive short simultaneous presses so far
+    uint8_t tap_gap;    // samples since the last tap was released
     INPUT_t state;
 } InputState_t;
 
@@ -67,28 +67,66 @@ typedef struct {
 //   0.05 sec * 60 = 3 sec to hold SAVE gesture
 #define SAVE_HOLD_THRESHOLD 60
 
+// RECAL gesture: press and release both buttons together RECAL_TAP_COUNT
+// times in a row. Each press must be short and the pause between two taps
+// must stay below the timeout, otherwise the sequence starts over.
+#define RECAL_TAP_COUNT 5
+//   0.05 sec * 20 = 1 sec: longest press that still counts as a tap
+#define TAP_MAX_HOLD 20
+//   0.05 sec * 40 = 2 sec: longest pause between two taps
+#define TAP_MAX_GAP 40
+
 INPUT_t btn_gesture(ButtonState_t btn) {
     static InputState_t input = {
         .save_hold = 0,
+        .tap_count = 0,
+        .tap_gap = 0,
         .state = INPUT_IDLE,
     };
 
     switch (input.state) {
         case INPUT_IDLE:
             if (PRESSED(btn.UP) && RELEASED(btn.DOWN)) {
+                input.save_hold = 0;
+                input.tap_count = 0;
                 input.state = INPUT_UP;
             } else if (RELEASED(btn.UP) && PRESSED(btn.DOWN)) {
+                input.save_hold = 0;
+                input.tap_count = 0;
                 input.state = INPUT_DOWN;
             } else if (PRESSED(btn.UP) && PRESSED(btn.DOWN)) {
                 input.save_hold++;
                 if (input.save_hold >= SAVE_HOLD_THRESHOLD) {
                     input.save_hold = 0;
+                    input.tap_count = 0;
                     input.state = INPUT_SAVE;
                 } else {
                     input.state = INPUT_IDLE;
                 }
             } else  { // both RELEASED
                 input.state = INPUT_IDLE;
+
+                if (input.save_hold > 0) {
+                    // A simultaneous press has just ended
+                    if (input.save_hold <= TAP_MAX_HOLD) {
+                        input.tap_count++;
+                    } else {
+                        input.tap_count = 0; // too long to be a tap
+                    }
+                    input.save_hold = 0;
+                    input.tap_gap = 0;
+
+                    if (input.tap_count >= RECAL_TAP_COUNT) {
+                        input.tap_count = 0;
+                        input.state = INPUT_RECAL;
+                    }
+                } else if (input.tap_count > 0) {
+                    // Waiting for the next tap
+                    input.tap_gap++;
+                    if (input.tap_gap >= TAP_MAX_GAP) {
+                        input.tap_count = 0;
+                    }
+                }
             }
             break;
             
@@ -98,6 +136,13 @@ INPUT_t btn_gesture(ButtonState_t btn) {
             } else {
                 input.state = INPUT_IDLE;
             }
+            break;
+
+        case INPUT_RECAL:
+            // One-shot gesture, reported on the release of the last tap.
+            // Back to IDLE at the next sample, so that a button press
+            // right after is seen (and aborts the calibration).
+            input.state = INPUT_IDLE;
             break;
             
         case INPUT_UP:
