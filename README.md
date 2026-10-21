@@ -26,13 +26,16 @@ Downloadable firmware images are built in MPLAB X with the XC8 compiler. The mic
 | <kbd>△</kbd> + <kbd>▽</kbd> | Move up to upper memory position  |
 | <kbd>▽</kbd> | Move down |
 | <kbd>▽</kbd> + <kbd>△</kbd> | Move down to lower memory position  |
-| <kbd>△</kbd><kbd>▽</kbd> (hold 3 sec) | Save current position |
+| <kbd>△</kbd><kbd>▽</kbd> (Hold 3 sec) | Save current position |
+| <kbd>△</kbd><kbd>▽</kbd> (Press 5 times) | Calibration reset |
 
 "+" means press the first button, and while holding it, press the second button, then release both. Just like <kbd>Ctrl</kbd> + <kbd>X</kbd>.
 
 Automatic movement to a stored position can be canceled by pressing either button or cutting power.
 
 For the *Save* gesture, press both buttons at the same time and hold for 3 seconds until the legs click. The firmware will overwrite either the lower or upper stored position, whichever is closer to the current position. The table should not be moving during the hold, otherwise one of the other gestures was triggered. Both buttons must be pressed within the software debounce interval.
+
+For the *Calibration* gesture, press both buttons simultaneously 5 times in quick succession will trigger a recalibration of the lower and upper limits. Please note that the desk will automatically move down and then back up to recalibrate its positions. Ensure that there are no objects in the way that the desk might collide with when in its lowest position, and check that cables have sufficient length for the highest position.
 
 ## Memory Positions
 
@@ -46,8 +49,6 @@ Memory positions are stored in the PIC EEPROM. These are 16-bit little-endian in
 ## Disclaimer
 
 Use at your own risk.
-
-The real reason that position memory is not built into the stock firmware is probably for safety and liability. Requiring a human to hold a button while the table is moving keeps a human in the control loop.
 
 Ensure that the path of the table is clear during all movement.
 
