@@ -13,6 +13,8 @@ void bctrl_populate_cmd(void);
 void bctrl_next_state(void);
 
 int16_t bctrl_pos;
+int16_t bctrl_enc_diff;
+bool bctrl_enc_valid;
 uint8_t bctrl_status_08;
 uint8_t bctrl_status_09;
 BCTRL_state_t current_state = BCTRL_AFTER_SCAN;
@@ -182,6 +184,9 @@ void bctrl_timer(void) {
         // BUI might call back bctrl_set_target to change target state
         // BCTRL_STOP based on the position
         bctrl_pos = cmd_data.encoder; // encoder val from whatever cmd sent
+        bctrl_enc_valid = (data_space_08.encoder >= 0 &&
+        data_space_09.encoder >= 0);
+        bctrl_enc_diff = data_space_08.encoder - data_space_09.encoder;
         bctrl_report_pos(bctrl_pos);
 
         // Finish bus transaction
