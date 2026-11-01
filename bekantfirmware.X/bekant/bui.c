@@ -48,6 +48,22 @@ typedef enum {
 #define CAL_STALL_TOLERANCE   2    // encoder counts
 #define CAL_TIMEOUT_CYCLES    600  // abort a phase after 60 s
 #define CAL_ERR_CYCLES        10   // abort after 1 s of negative encoder values
+
+/*
+ * Tilt protection
+ *
+ * The two legs have their own encoder. During a move both should advance
+ * together, so the difference between them should stay about constant.
+ * The absolute difference at rest is just an offset between the encoders, so
+ * the difference is measured relative to its value at the start of the move.
+ * If it drifts by more than TILT_MAX_DIFF for TILT_CONFIRM_CYCLES cycles
+ * (100 ms each), one leg is lagging behind: stop the desk.
+ *
+ * TODO: TILT_MAX_DIFF is a provisional value. It has to be larger than the
+ * normal drift over a full travel and as small as possible above that.
+ */
+#define TILT_MAX_DIFF         0x0040 // encoder counts
+#define TILT_CONFIRM_CYCLES   2
 #define CAL_MIN_RANGE         0x0200 // below this, the result is not credible
 
 BUI_state_t bui_state = BUI_STOP;
@@ -63,26 +79,61 @@ static uint8_t cal_err;
 static int16_t cal_last_pos;
 static int16_t cal_low_stop;
 static volatile bool cal_save_pending = false;
+static uint8_t cal_save_step; // field being written by bui_save_step()
+static bool bui_loaded = false; // EEPROM read (done from the interrupt handler)
+static uint8_t cal_save_tries;
 
 typedef struct {
     int16_t low_pos;
     int16_t high_pos;
-    int16_t limit_min;
-    int16_t limit_max;
-    uint8_t calibrated; // CAL_MAGIC once calibrated
 } BUI_saved_t;
 
-// Re-flashing resets the EEPROM to these values (calibrated = 0), which
-// triggers the calibration run at the next boot.
+// Calibration result. It is stored twice, each copy with a checksum, so that
+// a copy corrupted or half-written by a power cut is detected and the other
+// one is used.
+typedef struct {
+    int16_t limit_min;
+    int16_t limit_max;
+    uint8_t check;
+} BUI_cal_t;
+
 __eeprom BUI_saved_t saved = {
     .high_pos = BUI_DEFAULT_LIMIT_MAX,
-    .low_pos = BUI_DEFAULT_LIMIT_MIN,
+    .low_pos = BUI_DEFAULT_LIMIT_MIN
+};
+
+// Re-flashing resets the EEPROM to these values. The checksum of the default
+// limits is not 0, so both copies are invalid ("not calibrated"), which
+// triggers the calibration run at the next boot.
+__eeprom BUI_cal_t cal_a = {
     .limit_min = BUI_DEFAULT_LIMIT_MIN,
     .limit_max = BUI_DEFAULT_LIMIT_MAX,
-    .calibrated = 0
+    .check = 0
+};
+__eeprom BUI_cal_t cal_b = {
+    .limit_min = BUI_DEFAULT_LIMIT_MIN,
+    .limit_max = BUI_DEFAULT_LIMIT_MAX,
+    .check = 0
 };
 
 void bui_save_pos(int16_t save_pos);
+
+static uint8_t bui_cal_check(int16_t lo, int16_t hi) {
+    return (uint8_t)(CAL_MAGIC ^ (uint8_t)lo ^ (uint8_t)(lo >> 8)
+            ^ (uint8_t)hi ^ (uint8_t)(hi >> 8));
+}
+
+/**
+ * Whether a stored copy is usable: credible limits and matching checksum.
+ * A blank (0xff) or half-written copy is rejected.
+ */
+static bool bui_cal_valid(int16_t lo, int16_t hi, uint8_t check) {
+    return lo >= 0 && hi - lo >= CAL_MIN_RANGE
+            && check == bui_cal_check(lo, hi);
+}
+
+#define BUI_CAL_MATCH(copy, lo, hi, chk) \
+    (copy.limit_min == (lo) && copy.limit_max == (hi) && copy.check == (chk))
 
 static int16_t bui_clamp(int16_t value, int16_t min_value, int16_t max_value) {
     if (value < min_value) {
@@ -110,6 +161,39 @@ static bool bui_at_lower_limit(void) {
 static void bui_stop(void) {
     bui_state = BUI_STOP;
     bctrl_set_target(BCTRL_STOP);
+}
+
+/* ------------------------- Tilt protection --------------------------- */
+
+static bool tilt_armed = false;  // reference difference captured for this move
+static int16_t tilt_ref;         // encoder difference at the start of the move
+static uint8_t tilt_count;       // consecutive cycles over the threshold
+static bool tilt_fault = false;  // latched: manual moves refused
+
+/**
+ * Called once per cycle while the desk is moving (not in calibration).
+ */
+static void bui_tilt_update(void) {
+    if (!bctrl_enc_valid) {
+        return; // encoder error: no reliable difference this cycle
+    }
+
+    if (!tilt_armed) {
+        tilt_ref = bctrl_enc_diff;
+        tilt_armed = true;
+        tilt_count = 0;
+        return;
+    }
+
+    if (abs(bctrl_enc_diff - tilt_ref) > TILT_MAX_DIFF) {
+        tilt_count++;
+        if (tilt_count >= TILT_CONFIRM_CYCLES) {
+            tilt_fault = true;
+            bui_stop();
+        }
+    } else {
+        tilt_count = 0;
+    }
 }
 
 /**
@@ -144,6 +228,11 @@ static void bui_cal_start_phase(BUI_state_t state, BCTRL_state_t target) {
     cal_stall = 0;
     cal_err = 0;
     cal_last_pos = cur_pos;
+    // Calibration drives both legs against their end stops, which levels
+    // them again: this clears a tilt fault.
+    tilt_fault = false;
+    tilt_armed = false;
+    tilt_count = 0;
     bctrl_set_target(target);
 }
 
@@ -221,62 +310,120 @@ static void bui_cal_step(int16_t pos) {
 
     limit_min = lo;
     limit_max = hi;
-    low_pos = lo;
-    high_pos = hi;
-    cal_save_pending = true; // EEPROM is written from bui_task(), not here
+    // Keep the user's memorized positions: only bring them back inside the
+    // new limits if they fall outside. (On a first calibration after flashing
+    // they are the factory defaults, which end up on or near the limits.)
+    low_pos = bui_clamp(low_pos, lo, hi);
+    high_pos = bui_clamp(high_pos, lo, hi);
+    cal_save_tries = 0;
+    cal_save_step = 0;
+    cal_save_pending = true; // written by bui_save_step(), one field per cycle
 }
 
 /**
- * Background task, to be called from the main loop.
- * Writes the calibration result into the EEPROM outside of the interrupt
- * handler, so that the slow EEPROM writes don't disturb the LIN bus timing.
+ * Saves the calibration result into the EEPROM, one field per call.
+ *
+ * Called from bui_set_pos(), i.e. once per bus cycle (100 ms), when the bus is
+ * idle until the next cycle. Writing one field at a time keeps each EEPROM
+ * write short (a few ms), like the SAVE gesture. It does not depend on the
+ * main loop.
+ *
+ * Copy A first, then copy B. At boot A is preferred, so a power cut while
+ * writing A leaves the previous B, and a power cut while writing B leaves
+ * the new A. The checksum is written last in each copy, so a partial copy
+ * stays invalid.
  */
-void bui_task(void) {
-    if (!cal_save_pending) {
-        return;
-    }
-
+static void bui_save_step(void) {
     int16_t lo = limit_min;
     int16_t hi = limit_max;
+    uint8_t chk = bui_cal_check(lo, hi);
 
-    saved.limit_min = lo;
+    switch (cal_save_step) {
+        case 0: cal_a.limit_min = lo; break;
+        case 1: cal_a.limit_max = hi; break;
+        case 2: cal_a.check = chk; break;
+        case 3: cal_b.limit_min = lo; break;
+        case 4: cal_b.limit_max = hi; break;
+        case 5: cal_b.check = chk; break;
+        case 6:
+            // Memorized positions: only rewritten if the new limits moved them
+            if (saved.low_pos != low_pos) {
+                saved.low_pos = low_pos;
+            }
+            break;
+        case 7:
+            if (saved.high_pos != high_pos) {
+                saved.high_pos = high_pos;
+            }
+            break;
+        default:
+            // Everything written: read it back before declaring success.
+            if (BUI_CAL_MATCH(cal_a, lo, hi, chk)
+                    && BUI_CAL_MATCH(cal_b, lo, hi, chk)
+                    && saved.low_pos == low_pos
+                    && saved.high_pos == high_pos) {
+                cal_save_pending = false;
+                // Click: confirms the limits were read back correctly
+                // from the EEPROM.
+                bctrl_set_target(BCTRL_CLICK);
+            } else {
+                // Write failed: start again, but not forever.
+                cal_save_tries++;
+                if (cal_save_tries >= 3) {
+                    cal_save_pending = false;
+                } else {
+                    cal_save_step = 0;
+                }
+            }
+            return;
+    }
     CLRWDT();
-    saved.limit_max = hi;
-    CLRWDT();
-    saved.low_pos = lo;
-    CLRWDT();
-    saved.high_pos = hi;
-    CLRWDT();
-    saved.calibrated = CAL_MAGIC; // last, so a partial write stays uncalibrated
-    CLRWDT();
-
-    cal_save_pending = false;
+    cal_save_step++;
 }
 
 /* ------------------------------- Inputs ------------------------------ */
 
 /**
- * Initialize from stored values.
- * Starts the calibration run if the desk has never been calibrated.
+ * Load the stored values.
+ * Starts the calibration run if no valid calibration is stored.
+ *
+ * Runs from the interrupt handler, on the first call to bui_set_pos():
+ * XC8 doesn't allow __eeprom variables to be accessed from both the main
+ * program and the interrupt handler, so every EEPROM access of this module
+ * is done from the interrupt handler.
  */
-void bui_init(void) {
-    bool calibrated = (saved.calibrated == CAL_MAGIC);
+static void bui_load(void) {
+    bool calibrated;
 
-    if (calibrated) {
-        int16_t lo = saved.limit_min;
-        int16_t hi = saved.limit_max;
-        if (hi - lo >= CAL_MIN_RANGE) {
-            limit_min = lo;
-            limit_max = hi;
-        } else {
-            calibrated = false; // corrupted EEPROM
-        }
+    int16_t lo = cal_a.limit_min;
+    int16_t hi = cal_a.limit_max;
+    if (bui_cal_valid(lo, hi, cal_a.check)) {
+        calibrated = true;
+    } else {
+        // Copy A invalid (or never written): try copy B
+        lo = cal_b.limit_min;
+        hi = cal_b.limit_max;
+        calibrated = bui_cal_valid(lo, hi, cal_b.check);
     }
 
-    // Stored positions are clamped to the limits, in case the EEPROM
-    // is blank (0xffff) or corrupted.
-    low_pos = bui_clamp(saved.low_pos, limit_min, limit_max);
-    high_pos = bui_clamp(saved.high_pos, limit_min, limit_max);
+    if (calibrated) {
+        limit_min = lo;
+        limit_max = hi;
+    }
+
+    if (calibrated) {
+        // Stored positions are clamped to the limits, in case the EEPROM
+        // is blank (0xffff) or corrupted.
+        low_pos = bui_clamp(saved.low_pos, limit_min, limit_max);
+        high_pos = bui_clamp(saved.high_pos, limit_min, limit_max);
+    } else {
+        // The real limits are not known yet: don't squeeze the user's
+        // positions into the default limits. The calibration will bring
+        // them inside the measured limits when it ends. Only reject
+        // obviously invalid values (blank EEPROM reads as -1).
+        low_pos = bui_clamp(saved.low_pos, 0, 0x7fff);
+        high_pos = bui_clamp(saved.high_pos, 0, 0x7fff);
+    }
 
     if (!calibrated) {
         bui_cal_start_phase(BUI_CAL_DOWN, BCTRL_DOWN);
@@ -284,10 +431,22 @@ void bui_init(void) {
 }
 
 /**
+ * Initialize the module. The stored values are loaded a moment later, at the
+ * first bus cycle (see bui_load()); until then, buttons are ignored.
+ */
+void bui_init(void) {
+    bui_loaded = false;
+}
+
+/**
  * 
  * @param input Input gesture
  */
 void bui_input(INPUT_t input) {
+    if (!bui_loaded) {
+        return; // stored values not loaded yet (first bus cycle)
+    }
+
     switch (bui_state) {
         case BUI_CAL_DOWN:
         case BUI_CAL_UP:
@@ -298,6 +457,12 @@ void bui_input(INPUT_t input) {
             break;
 
         case BUI_STOP:
+            if (tilt_fault && (input == INPUT_UP || input == INPUT_DOWN
+                    || input == INPUT_MEM_UP || input == INPUT_MEM_DOWN)) {
+                // The tilt protection stopped the desk: refuse to move
+                // until a recalibration (5 taps) or a power cycle.
+                break;
+            }
             if (input == INPUT_UP) {
                 bui_go_up();
             } else if (input == INPUT_DOWN) {
@@ -310,7 +475,7 @@ void bui_input(INPUT_t input) {
                 bctrl_set_target(BCTRL_DOWN);
             } else if (input == INPUT_SAVE) {
                 bui_save_pos(cur_pos);
-            } else if (input == INPUT_RECAL) {
+            } else if (input == INPUT_RECAL && !cal_save_pending) {
                 // Both buttons tapped 5 times: measure the end stops again.
                 // The previous calibration stays valid if this one is aborted.
                 bui_cal_start_phase(BUI_CAL_DOWN, BCTRL_DOWN);
@@ -368,9 +533,26 @@ void bui_input(INPUT_t input) {
 void bui_set_pos(int16_t pos) {
     cur_pos = pos;
 
+    if (!bui_loaded) {
+        bui_loaded = true;
+        bui_load(); // may start the calibration
+        return;
+    }
+
+    if (cal_save_pending) {
+        bui_save_step();
+    }
+
     if (bui_state == BUI_CAL_DOWN || bui_state == BUI_CAL_UP) {
         bui_cal_step(pos);
         return;
+    }
+
+    if (bui_state == BUI_STOP) {
+        tilt_armed = false; // next move captures a new reference
+        tilt_count = 0;
+    } else {
+        bui_tilt_update(); // may stop the desk
     }
 
     if (cur_pos < 0) {
@@ -418,6 +600,12 @@ void bui_set_pos(int16_t pos) {
 void bui_save_pos(int16_t save_pos) {
     if (save_pos < 0) {
         // Encoder value indicates error state
+        return;
+    }
+
+    if (cal_save_pending) {
+        // The calibration result is being written (about 1 s): don't start a
+        // second EEPROM write at the same time.
         return;
     }
 
