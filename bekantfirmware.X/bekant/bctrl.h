@@ -1,5 +1,6 @@
 
 #include <stdint.h>
+#include <stdbool.h>
 
 typedef enum {
     BCTRL_AFTER_SCAN,
@@ -22,3 +23,8 @@ extern void (*bctrl_report_pos)(int16_t pos);
 
 // BUI also needs this value so it can anticipate stops
 #define BCTRL_DECEL_MARGIN 0x6c
+
+// Difference between the two leg encoders (0x08 - 0x09), updated once per
+// bus transaction. Valid only when bctrl_enc_valid is true.
+extern int16_t bctrl_enc_diff;
+extern bool bctrl_enc_valid;
